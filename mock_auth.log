@@ -1,0 +1,8 @@
+May 27 10:18:04 hostname sshd[12345]: Conexão fechada pelo usuário autenticador guest 192.168.1.50 porta 54321 [pré-autenticação]
+May 27 10:18:14 hostname sshd[22222]: Senha incorreta para usuário inválido admin0 de 192.168.1.99 porta 50000 ssh2
+May 27 10:18:15 hostname sshd[22222]: Senha incorreta para usuário inválido admin1 de 192.168.1.99 porta 50001 ssh2
+May 27 10:18:15 hostname sshd[22222]: Senha incorreta para usuário inválido admin2 de 192.168.1.99 porta 50002 ssh2
+May 27 10:18:16 hostname sshd[22222]: Senha incorreta para usuário inválido admin3 de 192.168.1.99 porta 50003 ssh2
+May 27 10:18:16 hostname sshd[22222]: Senha incorreta para usuário inválido admin4 de 192.168.1.99 porta 50004 ssh2
+May 27 10:18:17 hostname sshd[22222]: Senha incorreta para usuário inválido admin5 de 192.168.1.99 porta 50005 ssh2
+May 27 10:18:37 hostname sudo: pam_unix(sudo:session): sessão aberta para o usuário root por (uid=1000)
