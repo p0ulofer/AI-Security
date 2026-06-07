@@ -187,9 +187,15 @@ class EventPreprocessor:
             if attempts:
                 unique_ports = {port for ts, port in attempts}
                 if len(unique_ports) > self.port_scan_threshold:
-                    triggered_rules.append(
-                        f"Varredura de portas via tráfego real detectada do IP {ip} (tentou {len(unique_ports)} portas diferentes nos últimos 30s)"
-                    )
+                    last_alerted = self._last_alert_time.get(f"portscan_{ip}", 0)
+                    if now - last_alerted > self.alert_suppression_seconds:
+                        triggered_rules.append(
+                            f"Varredura de portas via tráfego real detectada do IP {ip} (tentou {len(unique_ports)} portas diferentes nos últimos 30s)"
+                        )
+                        self._last_alert_time[f"portscan_{ip}"] = now
+                    else:
+                        restante = int(self.alert_suppression_seconds - (now - last_alerted))
+                        print(f"  [Supressão] Port scan de {ip} suprimido. Próximo permitido em {restante}s.")
             else:
                 self._port_scan_tracker.pop(ip, None)
 
@@ -197,9 +203,15 @@ class EventPreprocessor:
             while syn_times and now - syn_times[0] > 30:
                 syn_times.popleft()
             if len(syn_times) > self.syn_flood_threshold:
-                triggered_rules.append(
-                    f"SYN flood via tráfego real detectado do IP {ip} ({len(syn_times)} pacotes SYN nos últimos 30s)"
-                )
+                last_alerted = self._last_alert_time.get(f"synflood_{ip}", 0)
+                if now - last_alerted > self.alert_suppression_seconds:
+                    triggered_rules.append(
+                        f"SYN flood via tráfego real detectado do IP {ip} ({len(syn_times)} pacotes SYN nos últimos 30s)"
+                    )
+                    self._last_alert_time[f"synflood_{ip}"] = now
+                else:
+                    restante = int(self.alert_suppression_seconds - (now - last_alerted))
+                    print(f"  [Supressão] SYN flood de {ip} suprimido. Próximo permitido em {restante}s.")
             if not syn_times:
                 self._syn_flood_tracker.pop(ip, None)
 
