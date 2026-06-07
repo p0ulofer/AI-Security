@@ -187,7 +187,10 @@ class EventPreprocessor:
                 
                 # Rule: Connection spike
                 if count >= self.conn_spike_threshold:
-                    triggered_rules.append(f"Pico de conexões do IP {ip} ({count} conexões capturadas)")
+                    last_alerted = self._last_alert_time.get(ip, 0)
+                    if now - last_alerted > self.alert_suppression_seconds:
+                        triggered_rules.append(f"Pico de conexões do IP {ip} ({count} conexões capturadas)")
+                        self._last_alert_time[ip] = now
 
         # 3. Analisa as regras heurísticas de pacotes em tempo real (Scapy live)
         now = time.time()
