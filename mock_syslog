@@ -1,3 +1,0 @@
-May 27 10:18:04 hostname systemd[1]: Iniciou o Agendador de Comandos Periódicos.
-May 27 10:18:04 hostname systemd[1]: Atingiu o alvo Sistema Multi-Usuário.
-May 27 10:18:37 hostname kernel: [12345.678] main_app[8888]: falha_de_segmentacao em 0 ip 0000000000000000 sp 00007ffd12345678 erro 4 em main_app

@@ -1,7 +1,7 @@
 import time
 import argparse
 import sys
-from collector import LogCollector
+from collector_live import LivePacketCollector
 from preprocessor import EventPreprocessor
 from ollama_client import OllamaClient
 from alerter import Alerter
@@ -13,19 +13,33 @@ def main():
     parser.add_argument("--db", type=str, default="threats.db", help="Path to SQLite database")
     parser.add_argument("--model", type=str, default="mistral:7b-instruct-q4_K_M", help="Ollama model name")
     parser.add_argument("--url", type=str, default="http://localhost:11434", help="Ollama base URL")
-    parser.add_argument("--logs", type=str, default="/var/log/auth.log,/var/log/syslog", help="Comma-separated paths to log files to tail")
+    parser.add_argument("--iface", type=str, default=None, help="Network interface to capture live traffic on")
+    parser.add_argument("--ssh-fail-threshold",   type=int,   default=5,    help="Falhas de login SSH para disparar alerta (default: 5)")
+    parser.add_argument("--conn-spike-threshold",  type=int,   default=10,   help="Conexões do mesmo IP para disparar alerta (default: 10)")
+    parser.add_argument("--port-scan-threshold",   type=int,   default=10,   help="Portas diferentes para detectar port scan (default: 10)")
+    parser.add_argument("--syn-flood-threshold",   type=int,   default=50,   help="Pacotes SYN para detectar SYN flood (default: 50)")
+    parser.add_argument("--volume-mb-threshold",   type=float, default=5.0,  help="Volume em MB para detectar exfiltração (default: 5.0)")
     
     args = parser.parse_args()
 
     print("Inicializando componentes...")
-    # Read specified log files
-    log_paths = [p.strip() for p in args.logs.split(",")]
-    collector = LogCollector(log_paths=log_paths)
-    preprocessor = EventPreprocessor(ssh_fail_threshold=5, conn_spike_threshold=10)
+    print(f"  Thresholds: SSH={args.ssh_fail_threshold} | ConnSpike={args.conn_spike_threshold} | "
+          f"PortScan={args.port_scan_threshold} portas | SYN={args.syn_flood_threshold} pkts | "
+          f"Volume={args.volume_mb_threshold}MB")
+
+    collector = LivePacketCollector(iface=args.iface)
+        
+    preprocessor = EventPreprocessor(
+        ssh_fail_threshold=args.ssh_fail_threshold,
+        conn_spike_threshold=args.conn_spike_threshold,
+        port_scan_threshold=args.port_scan_threshold,
+        syn_flood_threshold=args.syn_flood_threshold,
+        volume_mb_threshold=args.volume_mb_threshold,
+    )
     ollama = OllamaClient(base_url=args.url, model=args.model)
     alerter = Alerter(db_path=args.db)
 
-    print("Iniciando threads coletoras de logs...")
+    print("Iniciando captura de pacotes em tempo real...")
     collector.start()
 
     window_size = args.window
@@ -59,7 +73,7 @@ def main():
 
             # 3. Check if the window has elapsed
             if current_time - last_window_time >= window_size:
-                print(f"\nProcessando janela de {window_size} segundos ({len(preprocessor.log_buffer)} eventos de log, {len(preprocessor.connections_buffer)} capturas de conexão)...")
+                print(f"\nProcessando janela de {window_size} segundos ({len(preprocessor.log_buffer)} pacotes capturados, {len(preprocessor.connections_buffer)} capturas de conexão)...")
                 is_suspicious, rules, summary = preprocessor.process_window()
 
                 if is_suspicious:
