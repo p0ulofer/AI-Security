@@ -19,23 +19,16 @@ class EventPreprocessor:
         self.volume_mb_threshold = volume_mb_threshold
         self.log_buffer: List[Dict[str, Any]] = []
         self.connections_buffer: List[List[Dict[str, Any]]] = []
-        # Rastreador persistente de janela deslizante: não é limpo entre janelas
-        # Chave: IP, Valor: deque de timestamps (float) das falhas de login
         self._failed_login_tracker: Dict[str, deque] = {}
-        # Supressão de alertas por IP: evita re-alertas repetidos do mesmo IP
-        # Chave: IP, Valor: timestamp do último alerta gerado
         self._last_alert_time: Dict[str, float] = {}
-
-        # Rastreadores persistentes para tráfego live (Scapy)
-        self._port_scan_tracker: Dict[str, deque] = {}  # IP -> deque((timestamp, port))
-        self._syn_flood_tracker: Dict[str, deque] = {}  # IP -> deque(timestamp)
-        self._volume_tracker: Dict[str, deque] = {}     # IP -> deque((timestamp, size))
+        self._port_scan_tracker: Dict[str, deque] = {}
+        self._syn_flood_tracker: Dict[str, deque] = {}
+        self._volume_tracker: Dict[str, deque] = {}
         self._sensitive_ports = {22, 23, 3389, 445, 1433}
 
     def add_log(self, log_event: Dict[str, Any]):
         self.log_buffer.append(log_event)
 
-        # Atualiza imediatamente o rastreador de janela deslizante
         content = log_event.get("content", "")
         content_lower = content.lower()
         is_fail = (
@@ -54,30 +47,33 @@ class EventPreprocessor:
                     self._failed_login_tracker[ip] = deque()
                 self._failed_login_tracker[ip].append(now)
 
-        # Se for um evento de pacote live, atualiza os rastreadores heurísticos específicos de rede
         packet_data = log_event.get("packet_data")
         if packet_data:
             now = time.time()
             src_ip = packet_data.get("src_ip")
+            dst_ip = packet_data.get("dst_ip")
             dport = packet_data.get("dport")
             proto = packet_data.get("proto")
             size = packet_data.get("size", 0)
             flags = packet_data.get("flags", "")
+
+            # Ignorar pacotes de resposta legítimos:
+            # se o destino é o próprio WSL e a origem é um IP externo,
+            # significa que é uma resposta a uma requisição nossa — não uma ameaça
+            WSL_LOCAL_IP = "172.29.105.246"
+            is_response_traffic = (dst_ip == WSL_LOCAL_IP and src_ip != WSL_LOCAL_IP)
             
-            if src_ip:
-                # 1. Port scan tracker
+            if src_ip and not is_response_traffic:
                 if dport is not None:
                     if src_ip not in self._port_scan_tracker:
                         self._port_scan_tracker[src_ip] = deque()
                     self._port_scan_tracker[src_ip].append((now, dport))
-                    
-                # 2. SYN flood tracker
+
                 if proto == "TCP" and "SYN" in flags:
                     if src_ip not in self._syn_flood_tracker:
                         self._syn_flood_tracker[src_ip] = deque()
                     self._syn_flood_tracker[src_ip].append(now)
-                    
-                # 3. Volume tracker
+
                 if src_ip not in self._volume_tracker:
                     self._volume_tracker[src_ip] = deque()
                 self._volume_tracker[src_ip].append((now, size))
@@ -88,20 +84,10 @@ class EventPreprocessor:
     def clear(self):
         self.log_buffer.clear()
         self.connections_buffer.clear()
-        # _failed_login_tracker e _last_alert_time são mantidos intencionalmente
-        # entre janelas para a janela deslizante e supressão de alertas
 
     def process_window(self) -> Tuple[bool, List[str], str]:
-        """
-        Processes the accumulated logs and network snapshots in the current window.
-        Returns:
-            - is_suspicious (bool): True if any simple rule triggered.
-            - triggered_rules (List[str]): List of names of the rules that triggered.
-            - structured_summary (str): Text summarizing the window's activity.
-        """
         triggered_rules = []
-        
-        # 1. Analyze logs for failed logins
+
         sudo_escalations = []
         general_warnings = []
 
@@ -109,25 +95,20 @@ class EventPreprocessor:
             content = log.get("content", "")
             content_lower = content.lower()
 
-            # Check for sudo/root actions (supports English and Portuguese)
             if ("session opened for user root" in content_lower or
                     "accepted password for root" in content_lower or
                     "sessão aberta para o usuário root" in content_lower or
                     "senha aceita para root" in content_lower):
                 sudo_escalations.append(content)
 
-            # Check for segfaults or core dumps (supports English and Portuguese)
             if ("segfault" in content_lower or "core dump" in content_lower or
                     "denied" in content_lower or "falha_de_segmentacao" in content_lower or
                     "negado" in content_lower):
                 general_warnings.append(content)
 
-        # Apply Rule 1 (Janela Deslizante): conta falhas de login dos últimos N segundos
-        # Isso elimina o problema de divisão de janela fixa (window splitting)
         now = time.time()
         failed_logins_by_ip: Dict[str, int] = {}
         for ip, timestamps in self._failed_login_tracker.items():
-            # Remove entradas mais antigas que a janela deslizante
             while timestamps and now - timestamps[0] > self.sliding_window_seconds:
                 timestamps.popleft()
             if timestamps:
@@ -138,64 +119,68 @@ class EventPreprocessor:
                 last_alerted = self._last_alert_time.get(ip, 0)
                 tempo_desde_ultimo = now - last_alerted
                 if tempo_desde_ultimo > self.alert_suppression_seconds:
-                    # Dispara o alerta e registra o momento
                     triggered_rules.append(f"Alta taxa de falha de login do IP {ip} ({count} falhas nos últimos {self.sliding_window_seconds}s)")
                     self._last_alert_time[ip] = now
                 else:
-                    # Alerta suprimido — informa no terminal sem gerar novo alerta
                     restante = int(self.alert_suppression_seconds - tempo_desde_ultimo)
                     print(f"  [Supressão] Alerta de força bruta para {ip} suprimido. Próximo permitido em {restante}s.")
 
-        # Apply Rule 2: Root privilege execution / logins
         if sudo_escalations:
             triggered_rules.append(f"Sessão/login de root detectado ({len(sudo_escalations)} vezes)")
 
-        # Apply Rule 3: System errors / segfaults
         if general_warnings:
             triggered_rules.append(f"Exploração em potencial ou falhas de sistema detectadas ({len(general_warnings)} vezes)")
 
-        # 2. Analyze network connections
-        unique_remote_ports = {}
+        # Análise de conexões — rastreia porta LOCAL (destino real) e não porta efêmera de origem
+        unique_local_ports_by_remote_ip = {}
         conn_sightings_by_ip = {}
 
         if self.connections_buffer:
-            # Analyze all connection snapshots taken during this window
             for snapshot in self.connections_buffer:
                 for conn in snapshot:
                     raddr = conn.get("remote_address", "N/A")
-                    status = conn.get("status", "")
-                    
-                    if raddr != "N/A" and ":" in raddr:
-                        try:
-                            ip, port = raddr.rsplit(":", 1)
-                        except ValueError:
-                            continue
-                        
-                        # Filter out localhost and broadcast/any addresses
-                        if ip not in ["127.0.0.1", "::1", "0.0.0.0", "::"]:
-                            conn_sightings_by_ip[ip] = conn_sightings_by_ip.get(ip, 0) + 1
-                            
-                            if ip not in unique_remote_ports:
-                                unique_remote_ports[ip] = set()
-                            unique_remote_ports[ip].add(port)
-            
-            # Check for connection counts per remote IP
+                    laddr = conn.get("local_address", "N/A")
+
+                    if raddr == "N/A" or ":" not in raddr:
+                        continue
+                    if laddr == "N/A" or ":" not in laddr:
+                        continue
+
+                    try:
+                        remote_ip, remote_port = raddr.rsplit(":", 1)
+                        _, local_port = laddr.rsplit(":", 1)
+                        local_port_int  = int(local_port)
+                        remote_port_int = int(remote_port)
+                    except ValueError:
+                        continue
+
+                    if remote_ip in ["127.0.0.1", "::1", "0.0.0.0", "::"]:
+                        continue
+
+                    # Ignorar lado servidor: porta local baixa significa que somos o destino
+                    if local_port_int < 1024:
+                        continue
+
+                    conn_sightings_by_ip[remote_ip] = conn_sightings_by_ip.get(remote_ip, 0) + 1
+
+                    if remote_ip not in unique_local_ports_by_remote_ip:
+                        unique_local_ports_by_remote_ip[remote_ip] = set()
+                    # Registrar porta REMOTA (destino real do ataque)
+                    unique_local_ports_by_remote_ip[remote_ip].add(str(remote_port_int))
+
             for ip, count in conn_sightings_by_ip.items():
-                ports_count = len(unique_remote_ports.get(ip, set()))
+                ports_count = len(unique_local_ports_by_remote_ip.get(ip, set()))
                 if ports_count >= 5:
                     triggered_rules.append(f"Varredura/sondagem de portas em potencial vinda de {ip} (direcionada a {ports_count} portas diferentes)")
-                
-                # Rule: Connection spike
                 if count >= self.conn_spike_threshold:
                     last_alerted = self._last_alert_time.get(ip, 0)
                     if now - last_alerted > self.alert_suppression_seconds:
                         triggered_rules.append(f"Pico de conexões do IP {ip} ({count} conexões capturadas)")
                         self._last_alert_time[ip] = now
 
-        # 3. Analisa as regras heurísticas de pacotes em tempo real (Scapy live)
+        # Heurísticas de pacotes em tempo real (Scapy)
         now = time.time()
-        
-        # Heurística: Port scan (mesmo IP tentando mais de 10 portas diferentes em 30 segundos)
+
         for ip, attempts in list(self._port_scan_tracker.items()):
             while attempts and now - attempts[0][0] > 30:
                 attempts.popleft()
@@ -207,8 +192,7 @@ class EventPreprocessor:
                     )
             else:
                 self._port_scan_tracker.pop(ip, None)
-                
-        # Heurística: SYN flood (mais de 50 pacotes SYN do mesmo IP em 30 segundos)
+
         for ip, syn_times in list(self._syn_flood_tracker.items()):
             while syn_times and now - syn_times[0] > 30:
                 syn_times.popleft()
@@ -218,8 +202,7 @@ class EventPreprocessor:
                 )
             if not syn_times:
                 self._syn_flood_tracker.pop(ip, None)
-                
-        # Heurística: Volume anômalo (um IP enviando mais de 5MB em 30 segundos)
+
         for ip, vol_entries in list(self._volume_tracker.items()):
             while vol_entries and now - vol_entries[0][0] > 30:
                 vol_entries.popleft()
@@ -233,7 +216,6 @@ class EventPreprocessor:
             else:
                 self._volume_tracker.pop(ip, None)
 
-        # Heurística: Conexão em portas sensíveis (qualquer acesso às portas 22, 23, 3389, 445, 1433 na janela atual)
         sensitive_accesses = []
         for log in self.log_buffer:
             p_data = log.get("packet_data")
@@ -243,7 +225,7 @@ class EventPreprocessor:
                     src = p_data.get("src_ip")
                     proto = p_data.get("proto")
                     sensitive_accesses.append((src, dport, proto))
-                    
+
         if sensitive_accesses:
             unique_accesses = set(sensitive_accesses)
             for src, dport, proto in sorted(unique_accesses):
@@ -253,53 +235,50 @@ class EventPreprocessor:
 
         is_suspicious = len(triggered_rules) > 0
 
-        # Format a clean structured summary
+        # Monta o resumo estruturado
         summary_lines = []
         summary_lines.append("--- RESUMO DE ATIVIDADES DA JANELA ---")
-        
-        # Filtra eventos de log padrão vs tráfego live para relatório mais preciso
+
         standard_logs = [log for log in self.log_buffer if log.get("source") != "live_traffic"]
         live_packets = [log.get("packet_data") for log in self.log_buffer if log.get("source") == "live_traffic"]
-        
+
         summary_lines.append(f"Total de eventos de log capturados: {len(standard_logs)}")
         summary_lines.append(f"Total de pacotes de tráfego real capturados: {len(live_packets)}")
         summary_lines.append(f"Total de capturas de conexão: {len(self.connections_buffer)}")
-        
-        # Se houver pacotes live, adiciona resumo do tráfego real
+
         if live_packets:
             summary_lines.append("\nResumo do Tráfego Real Capturado:")
-            # Contagem de protocolos
             proto_counts = {}
             for p in live_packets:
                 proto = p.get("proto", "OUTRO")
                 proto_counts[proto] = proto_counts.get(proto, 0) + 1
             for proto, count in proto_counts.items():
                 summary_lines.append(f"  - Protocolo {proto}: {count} pacotes")
-        
+
         if failed_logins_by_ip:
             summary_lines.append("\nLogins malsucedidos por IP:")
             for ip, count in failed_logins_by_ip.items():
                 summary_lines.append(f"  - {ip}: {count} tentativas")
-                
+
         if sudo_escalations:
             summary_lines.append("\nLogins de Root / eventos de sudo:")
-            for e in sudo_escalations[:5]:  # Limit to 5
+            for e in sudo_escalations[:5]:
                 summary_lines.append(f"  - {e}")
-                
+
         if general_warnings:
             summary_lines.append("\nAvisos/erros do sistema:")
             for w in general_warnings[:5]:
                 summary_lines.append(f"  - {w}")
 
-        if unique_remote_ports:
-            summary_lines.append("\nConexões ativas/estabelecidas observadas nesta janela:")
-            for ip, ports in unique_remote_ports.items():
+        if unique_local_ports_by_remote_ip:
+            summary_lines.append("\nConexões ativas observadas nesta janela:")
+            for ip, ports in unique_local_ports_by_remote_ip.items():
                 ports_list = sorted(list(ports))
                 if len(ports_list) > 5:
                     ports_str = ", ".join(ports_list[:5]) + f"... (+{len(ports_list)-5} mais)"
                 else:
                     ports_str = ", ".join(ports_list)
-                summary_lines.append(f"  - IP Remoto: {ip} -> Portas locais direcionadas: [{ports_str}]")
+                summary_lines.append(f"  - IP Remoto: {ip} -> Porta(s) local(is) alvo: [{ports_str}]")
 
         if triggered_rules:
             summary_lines.append("\nRegras heurísticas ativadas:")
