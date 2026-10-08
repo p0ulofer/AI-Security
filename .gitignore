@@ -2,3 +2,11 @@ __pycache__/
 *.pyc
 .venv/
 *.db
+
+# Datasets grandes demais pro GitHub (baixe do Kaggle, ver README)
+ai-analysis/training/datasets/
+# Dataset de treino gerado localmente
+ai-analysis/training/dataset_real.csv
+# Artefatos de treino
+*.png
+*.pkl

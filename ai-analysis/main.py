@@ -5,13 +5,16 @@ from collector_live import LivePacketCollector
 from preprocessor import EventPreprocessor
 from ollama_client import OllamaClient
 from alerter import Alerter
+from feature_extractor import extract_features_by_ip
+from classifier import ThreatClassifier
+from combiner import combine_signals
 
 def main():
     parser = argparse.ArgumentParser(description="Local LLM Network Threat Detection System")
     parser.add_argument("--window", type=int, default=30, help="Window size in seconds for aggregation (default: 30)")
     parser.add_argument("--conn-interval", type=int, default=5, help="Interval in seconds for network connection snapshots (default: 5)")
     parser.add_argument("--db", type=str, default="threats.db", help="Path to SQLite database")
-    parser.add_argument("--model", type=str, default="mistral:7b-instruct-q4_K_M", help="Ollama model name")
+    parser.add_argument("--model", type=str, default="qwen2.5:3b-instruct-q4_K_M", help="Ollama model name")
     parser.add_argument("--url", type=str, default="http://localhost:11434", help="Ollama base URL")
     parser.add_argument("--iface", type=str, default=None, help="Network interface to capture live traffic on")
     parser.add_argument("--ssh-fail-threshold",   type=int,   default=5,    help="Falhas de login SSH para disparar alerta (default: 5)")
@@ -19,6 +22,9 @@ def main():
     parser.add_argument("--port-scan-threshold",   type=int,   default=10,   help="Portas diferentes para detectar port scan (default: 10)")
     parser.add_argument("--syn-flood-threshold",   type=int,   default=50,   help="Pacotes SYN para detectar SYN flood (default: 50)")
     parser.add_argument("--volume-mb-threshold",   type=float, default=5.0,  help="Volume em MB para detectar exfiltração (default: 5.0)")
+    parser.add_argument("--xgboost-model",         type=str,   default="models/xgboost_ids_model.json", help="Caminho do modelo XGBoost treinado (default: models/xgboost_ids_model.json)")
+    parser.add_argument("--xgboost-threshold",     type=float, default=0.7,  help="Probabilidade mínima do XGBoost para alertar (default: 0.7)")
+    parser.add_argument("--disable-ml",            action="store_true", help="Desativa o classificador XGBoost (modo somente heurísticas)")
     
     args = parser.parse_args()
 
@@ -26,6 +32,13 @@ def main():
     print(f"  Thresholds: SSH={args.ssh_fail_threshold} | ConnSpike={args.conn_spike_threshold} | "
           f"PortScan={args.port_scan_threshold} portas | SYN={args.syn_flood_threshold} pkts | "
           f"Volume={args.volume_mb_threshold}MB")
+
+    classifier = None
+    if args.disable_ml:
+        print("  Classificador XGBoost desativado (--disable-ml): operando apenas com heurísticas.")
+    else:
+        classifier = ThreatClassifier(model_path=args.xgboost_model)
+        print(f"  Classificador XGBoost: modelo={args.xgboost_model} | threshold={args.xgboost_threshold}")
 
     collector = LivePacketCollector(iface=args.iface)
         
@@ -76,16 +89,46 @@ def main():
                 print(f"\nProcessando janela de {window_size} segundos ({len(preprocessor.log_buffer)} pacotes capturados, {len(preprocessor.connections_buffer)} capturas de conexão)...")
                 is_suspicious, rules, summary = preprocessor.process_window()
 
-                if is_suspicious:
-                    print(f"Heurísticas ativadas: {', '.join(rules)}")
+                # Features por IP + score do XGBoost, em paralelo às heurísticas
+                ip_scores = {}
+                if classifier is not None:
+                    features_by_ip = extract_features_by_ip(preprocessor, current_time)
+                    ip_scores = {
+                        ip: classifier.score(features)
+                        for ip, features in features_by_ip.items()
+                    }
+
+                # Veredito único: heurísticas + XGBoost decidem se vale chamar o LLM
+                deve_alertar, severidade_combinada, sinais_xgboost = combine_signals(
+                    rules, ip_scores, score_threshold=args.xgboost_threshold
+                )
+
+                if deve_alertar:
+                    if rules:
+                        print(f"Heurísticas ativadas: {', '.join(rules)}")
+                    else:
+                        print("Nenhuma regra heurística ativada.")
+                    for sinal in sinais_xgboost:
+                        print(f"  [XGBOOST] {sinal}")
+                    print(f"Severidade combinada (heurísticas + XGBoost): {severidade_combinada:.1f}")
+
+                    # Acrescenta os sinais do XGBoost ao resumo antes de mandar pro LLM
+                    if sinais_xgboost:
+                        summary += "\n\nSinais do classificador XGBoost nesta janela:"
+                        for sinal in sinais_xgboost:
+                            summary += f"\n  [XGBOOST] {sinal}"
+
                     print("Enviando detalhes da janela suspeita para o modelo Ollama local para classificação de ameaças...")
                     
                     analysis = ollama.analyze_event(summary)
-                    
+
+                    # Severidade vinda do LLM; se ele falhar (score 0), usa a combinada
+                    severidade = analysis.get("score") or max(1, int(severidade_combinada + 0.5))
+
                     # Trigger alert with LLM output
                     alerter.trigger_alert(
                         threat_type=analysis.get("classification", "Desconhecido"),
-                        severity_score=analysis.get("score", 1),
+                        severity_score=severidade,
                         explanation=analysis.get("explanation", "N/A"),
                         details=summary
                     )

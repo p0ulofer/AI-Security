@@ -12,7 +12,7 @@ def test_ollama_connection():
         model_names = [m["name"] for m in models]
         print(f"Connection successful! Found models: {model_names}")
         
-        target_model = "mistral:7b-instruct-q4_K_M"
+        target_model = "qwen2.5:3b-instruct-q4_K_M"
         # Match base name or exact name (ollama sometimes appends :latest or similar)
         matching_models = [m for m in model_names if target_model in m or m in target_model]
         if not matching_models:
